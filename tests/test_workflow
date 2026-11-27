@@ -1,0 +1,99 @@
+import asyncio
+
+import pytest
+
+from app import db, tools
+from app.mcp_client import LocalToolClient
+
+
+def statuses():
+    return {i["id"]: i["status"] for i in tools.query_invoices()}
+
+
+def start(client, text="Approve all pending invoices"):
+    r = client.post("/workflows", json={"request": text})
+    assert r.status_code == 201
+    return r.json()
+
+
+def test_read_only_request_needs_no_approval(client):
+    out = start(client, "Review pending invoices")
+    assert out["status"] == "completed_no_changes"
+    assert out["pending_approval"] is None
+    assert statuses()["INV-1001"] == "pending"
+
+
+def test_hitl_pause_then_approve(client):
+    out = start(client)
+    assert out["status"] == "awaiting_approval"
+    assert statuses()["INV-1001"] == "pending"          # nothing written before approval
+    plan = {a["args"]["invoice_id"]: a["args"]["status"]
+            for a in out["pending_approval"]["proposed_actions"]}
+    assert plan["INV-1001"] == plan["INV-1002"] == plan["INV-1003"] == "approved"
+    assert plan["INV-1004"] == "flagged"   # unverified vendor
+    assert plan["INV-1005"] == "flagged"   # over limit
+    assert plan["INV-1006"] == "flagged"   # duplicate of INV-1003
+
+    done = client.post(f"/workflows/{out['run_id']}/approval",
+                       json={"approved": True, "approver": "alice"}).json()
+    assert done["status"] == "completed" and done["validation"]["passed"]
+    s = statuses()
+    assert s["INV-1001"] == "approved" and s["INV-1005"] == "flagged"
+    events = [e["event"] for e in client.get(f"/workflows/{out['run_id']}/audit").json()]
+    assert "approved" in events and "write_ok" in events
+
+
+def test_human_rejection_blocks_all_writes(client):
+    out = start(client)
+    done = client.post(f"/workflows/{out['run_id']}/approval",
+                       json={"approved": False, "approver": "bob", "comment": "not now"}).json()
+    assert done["status"] == "rejected_by_human"
+    assert set(statuses().values()) <= {"pending", "approved"} and statuses()["INV-1001"] == "pending"
+
+
+def test_reviewer_can_exclude_items(client):
+    out = start(client)
+    client.post(f"/workflows/{out['run_id']}/approval",
+                json={"approved": True, "approver": "alice", "excluded_invoice_ids": ["INV-1002"]})
+    s = statuses()
+    assert s["INV-1002"] == "pending" and s["INV-1001"] == "approved"
+
+
+def test_cannot_approve_twice(client):
+    out = start(client)
+    body = {"approved": True, "approver": "alice"}
+    assert client.post(f"/workflows/{out['run_id']}/approval", json=body).status_code == 200
+    assert client.post(f"/workflows/{out['run_id']}/approval", json=body).status_code == 409
+
+
+def test_executor_retries_transient_failure(client, monkeypatch):
+    real, calls = tools.FUNCS["update_invoice_status"], {"n": 0}
+
+    def flaky(invoice_id, status):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("db timeout")
+        return real(invoice_id, status)
+
+    monkeypatch.setitem(tools.FUNCS, "update_invoice_status", flaky)
+    out = start(client)
+    done = client.post(f"/workflows/{out['run_id']}/approval",
+                       json={"approved": True, "approver": "alice"}).json()
+    assert done["status"] == "completed"
+    assert statuses()["INV-1001"] == "approved"   # first write failed, then recovered
+    events = [e["event"] for e in client.get(f"/workflows/{out['run_id']}/audit").json()]
+    assert "write_failed" in events
+
+
+def test_write_tools_blocked_without_approver(client):
+    with pytest.raises(PermissionError):
+        asyncio.run(LocalToolClient().call("update_invoice_status",
+                                           {"invoice_id": "INV-1001", "status": "approved"}))
+
+
+def test_real_mcp_server_over_stdio(client):
+    from app.mcp_client import StdioMCPClient
+    rows = asyncio.run(StdioMCPClient().call("query_invoices", {"status": "pending"}))
+    assert len(rows) == 6
+    one = asyncio.run(StdioMCPClient().call("get_invoice", {"invoice_id": "INV-1001"}))
+    assert one["vendor"] == "Acme Supplies"
